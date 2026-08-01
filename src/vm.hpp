@@ -10,7 +10,6 @@
 #include "class.hpp"
 #include "inline_cache.hpp"
 #include "ast.hpp"
-#include <deque>
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -18,8 +17,10 @@
 
 struct StackFrame {
     Method* method = nullptr;
-    std::vector<Value> locals;
-    std::vector<Value> eval_stack;
+    // A frame is only metadata.  Locals and operands both live in VM::stack,
+    // which makes the complete language stack contiguous and walkable by GC.
+    size_t base = 0;
+    size_t locals_end = 0;
 };
 
 class VM {
@@ -48,8 +49,10 @@ public:
     static const uint32_t JIT_THRESHOLD = 20;
     void maybe_jit_compile(Method* method);
 
-    // Accessors
-    std::deque<StackFrame>& getCallStack() { return call_stack; }
+    // The interpreter owns the layout but the VM owns the storage so that GC
+    // can scan one precise range rather than a graph of per-frame vectors.
+    std::vector<StackFrame>& getCallStack() { return call_stack; }
+    std::vector<Value>& getStack() { return stack; }
     OMR_VMThread* getOMRThread() const { return omrVMThread; }
 
 private:
@@ -61,12 +64,17 @@ private:
     std::unordered_map<std::string, Class*> class_map;
     std::unordered_map<std::string, Method*> func_map;
 
-    // Note: std::deque guarantees that push_back/pop_back do not invalidate
-    // references to other elements. The interpreter holds references to the
-    // current frame and its eval_stack while making nested calls, so a plain
-    // std::vector here would reallocate and dangle those references.
-    std::deque<StackFrame> call_stack;
+    std::vector<StackFrame> call_stack;
+    std::vector<Value> stack;
     std::vector<Value> temp_roots;
+    // RootEntry stores a borrowed char pointer. Keep names stable until the
+    // root table is rebuilt on the next allocation.
+    std::vector<std::string> stack_root_names;
+
+    // The example OMR glue updates RootEntry::rootPtr after an evacuation.
+    // Copy those forwarded pointers back into the actual language stack before
+    // execution resumes.
+    void synchronize_moved_roots();
 };
 
 #endif // TOY_VM_HPP

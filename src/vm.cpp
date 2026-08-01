@@ -7,6 +7,8 @@
 #include "omrExampleVM.hpp"
 #include <iostream>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstring>
 
 VM::VM() {
     exampleVM._omrVM = nullptr;
@@ -87,34 +89,48 @@ void VM::update_stack_roots() {
         rootEntry = (RootEntry *)hashTableNextDo(&state);
     }
 
-    // Add all live object references on the call stack to root table
-    static char rootNameBuf[64];
-    size_t rootIdx = 0;
-    for (size_t f = 0; f < call_stack.size(); ++f) {
-        const auto& frame = call_stack[f];
-        for (size_t l = 0; l < frame.locals.size(); ++l) {
-            if (is_obj(frame.locals[l])) {
-                snprintf(rootNameBuf, sizeof(rootNameBuf), "f%zu_l%zu_%zu", f, l, rootIdx++);
-                RootEntry rEntry = { rootNameBuf, (omrobjectptr_t)decode_obj(frame.locals[l]) };
-                hashTableAdd(exampleVM.rootTable, &rEntry);
-            }
-        }
-        for (size_t s = 0; s < frame.eval_stack.size(); ++s) {
-            if (is_obj(frame.eval_stack[s])) {
-                snprintf(rootNameBuf, sizeof(rootNameBuf), "f%zu_s%zu_%zu", f, s, rootIdx++);
-                RootEntry rEntry = { rootNameBuf, (omrobjectptr_t)decode_obj(frame.eval_stack[s]) };
-                hashTableAdd(exampleVM.rootTable, &rEntry);
-            }
+    // A single contiguous language stack is the source of truth for roots.
+    // Do not reuse one formatting buffer: RootEntry retains its name pointer.
+    stack_root_names.clear();
+    stack_root_names.reserve(stack.size() + temp_roots.size());
+    for (size_t i = 0; i < stack.size(); ++i) {
+        if (is_obj(stack[i])) {
+            stack_root_names.push_back("stack_" + std::to_string(i));
+            RootEntry rEntry = { stack_root_names.back().c_str(), (omrobjectptr_t)decode_obj(stack[i]) };
+            hashTableAdd(exampleVM.rootTable, &rEntry);
         }
     }
 
     // Add temporary roots
     for (size_t t = 0; t < temp_roots.size(); ++t) {
         if (is_obj(temp_roots[t])) {
-            snprintf(rootNameBuf, sizeof(rootNameBuf), "temp_%zu", t);
-            RootEntry rEntry = { rootNameBuf, (omrobjectptr_t)decode_obj(temp_roots[t]) };
+            stack_root_names.push_back("temp_" + std::to_string(t));
+            RootEntry rEntry = { stack_root_names.back().c_str(), (omrobjectptr_t)decode_obj(temp_roots[t]) };
             hashTableAdd(exampleVM.rootTable, &rEntry);
         }
+    }
+}
+
+void VM::synchronize_moved_roots() {
+    if (!exampleVM.rootTable) return;
+
+    // OMR's stock scanner forwards the RootEntry copy, not our Value slot.
+    // The names created above give us a compact, precise bridge back to the
+    // flat VM stack after a collection or evacuation.
+    J9HashTableState state;
+    RootEntry *entry = (RootEntry *)hashTableStartDo(exampleVM.rootTable, &state);
+    while (entry != nullptr) {
+        if (entry->rootPtr != nullptr) {
+            const char* name = entry->name;
+            if (std::strncmp(name, "stack_", 6) == 0) {
+                const size_t index = std::strtoull(name + 6, nullptr, 10);
+                if (index < stack.size()) stack[index] = encode_obj((ToyObject*)entry->rootPtr);
+            } else if (std::strncmp(name, "temp_", 5) == 0) {
+                const size_t index = std::strtoull(name + 5, nullptr, 10);
+                if (index < temp_roots.size()) temp_roots[index] = encode_obj((ToyObject*)entry->rootPtr);
+            }
+        }
+        entry = (RootEntry *)hashTableNextDo(&state);
     }
 }
 
@@ -131,6 +147,9 @@ ToyObject* VM::allocate_object(Class* klass) {
 
     MM_ObjectAllocationModel allocationModel(env, allocSize, 0);
     ToyObject* obj = (ToyObject*)OMR_GC_AllocateObject(omrVMThread, &allocationModel);
+    // Allocation is a safepoint; the collector may have forwarded any object
+    // reachable from a language frame.
+    synchronize_moved_roots();
     if (!obj) {
         throw std::runtime_error("Out of Memory: OMR GC object allocation failed for class " + klass->name);
     }

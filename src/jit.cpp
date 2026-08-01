@@ -267,6 +267,11 @@ bool ToyJitMethodBuilder::buildIL() {
     // All return sites jump here; the method returns the stored value.
     DefineLocal("_retval", Int64);
     Store("_retval", ConstInt64(make_null()));
+    // Materialise arithmetic results through one virtual register.  This lets
+    // a guard select a fully inlined SmallInt operation or the generic
+    // (deoptimising) path without a C++ call on the monomorphic primitive path.
+    DefineLocal("_binary_result", Int64);
+    Store("_binary_result", ConstInt64(make_null()));
     OMR::JitBuilder::IlBuilder* returnLabel = OrphanBuilder();
 
     OMR::JitBuilder::IlBuilder* current = this;
@@ -348,14 +353,62 @@ bool ToyJitMethodBuilder::buildIL() {
                     OMR::JitBuilder::IlValue* right = stack.back(); stack.pop_back();
                     OMR::JitBuilder::IlValue* left = stack.back(); stack.pop_back();
 
-                    OMR::JitBuilder::IlValue* res = cur->Call("jit_helper_binary_op", 6,
-                        cur->Load("vm_ptr"),
-                        cur->ConstInt64(reinterpret_cast<int64_t>(method)),
-                        cur->ConstInt32(ic_idx),
-                        cur->ConstInt32(static_cast<int32_t>(op)),
+                    // The interpreter profiles operators as tagged SmallInts
+                    // overwhelmingly often. Keep that case entirely in IL;
+                    // objects and unexpected values take the generic path,
+                    // which is our deoptimisation boundary.
+                    OMR::JitBuilder::IlValue* bothInts = cur->EqualTo(
+                        cur->And(left, right), cur->ConstInt64(1));
+                    if (op == OP_DIV || op == OP_REM) {
+                        OMR::JitBuilder::IlValue* nonZero = cur->NotEqualTo(right, cur->ConstInt64(1));
+                        bothInts = cur->And(bothInts, nonZero);
+                    }
+                    OMR::JitBuilder::IlBuilder* primitive = nullptr;
+                    OMR::JitBuilder::IlBuilder* generic = nullptr;
+                    cur->IfThenElse(&primitive, &generic, bothInts);
+
+                    OMR::JitBuilder::IlValue* primitiveResult = nullptr;
+                    switch (op) {
+                        case OP_ADD:
+                            primitiveResult = primitive->Sub(primitive->Add(left, right), primitive->ConstInt64(1));
+                            break;
+                        case OP_SUB:
+                            primitiveResult = primitive->Add(primitive->Sub(left, right), primitive->ConstInt64(1));
+                            break;
+                        case OP_MUL: {
+                            auto* product = primitive->Mul(primitive->ShiftR(left, primitive->ConstInt32(1)), primitive->ShiftR(right, primitive->ConstInt32(1)));
+                            primitiveResult = primitive->Or(primitive->ShiftL(product, primitive->ConstInt32(1)), primitive->ConstInt64(1));
+                            break;
+                        }
+                        case OP_DIV:
+                        case OP_REM: {
+                            auto* l = primitive->ShiftR(left, primitive->ConstInt32(1));
+                            auto* r = primitive->ShiftR(right, primitive->ConstInt32(1));
+                            auto* quotient = op == OP_DIV ? primitive->Div(l, r) : primitive->Rem(l, r);
+                            primitiveResult = primitive->Or(primitive->ShiftL(quotient, primitive->ConstInt32(1)), primitive->ConstInt64(1));
+                            break;
+                        }
+                        default: {
+                            OMR::JitBuilder::IlValue* comparison = nullptr;
+                            if (op == OP_LT) comparison = primitive->LessThan(left, right);
+                            else if (op == OP_LE) comparison = primitive->LessOrEqualTo(left, right);
+                            else if (op == OP_GT) comparison = primitive->GreaterThan(left, right);
+                            else if (op == OP_GE) comparison = primitive->GreaterOrEqualTo(left, right);
+                            else if (op == OP_EQ) comparison = primitive->EqualTo(left, right);
+                            else comparison = primitive->NotEqualTo(left, right);
+                            primitiveResult = primitive->Or(primitive->ShiftL(primitive->ConvertTo(Int64, comparison), primitive->ConstInt32(1)), primitive->ConstInt64(1));
+                            break;
+                        }
+                    }
+                    primitive->Store("_binary_result", primitiveResult);
+                    generic->Store("_binary_result", generic->Call("jit_helper_binary_op", 6,
+                        generic->Load("vm_ptr"),
+                        generic->ConstInt64(reinterpret_cast<int64_t>(method)),
+                        generic->ConstInt32(ic_idx),
+                        generic->ConstInt32(static_cast<int32_t>(op)),
                         left,
-                        right);
-                    stack.push_back(res);
+                        right));
+                    stack.push_back(cur->Load("_binary_result"));
                     break;
                 }
                 case OP_REF_EQ:

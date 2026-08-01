@@ -49,32 +49,16 @@ Value Interpreter::execute_binary_op(Method* method, uint32_t ic_idx, Opcode op,
         return encode_int(res);
     }
 
-    // 2. Object Operator Overloading via Inline Cache
+    // The interpreter deliberately stays simple and authoritative: it never
+    // mutates inline-cache state.  Speculation belongs exclusively to compiled
+    // code, where a guard can be paired with a deoptimising fallback.
     if (is_obj(left)) {
         ToyObject* obj = decode_obj(left);
         Class* klass = obj->klass;
-        InlineCache& ic = method->inline_caches[ic_idx];
-
-        Method* targetMethod = nullptr;
-        if (ic.cached_class == klass) {
-            ic.hit_count++;
-            targetMethod = ic.cached_method;
-        } else {
-            ic.miss_count++;
-            targetMethod = klass->lookup_method(ic.method_name);
-            if (!targetMethod) {
-                throw std::runtime_error("Class '" + klass->name + "' does not implement operator method '" + ic.method_name + "'");
-            }
-            if (!ic.is_megamorphic) {
-                if (ic.cached_class == nullptr) {
-                    ic.cached_class = klass;
-                    ic.cached_method = targetMethod;
-                } else {
-                    ic.is_megamorphic = true;
-                    ic.cached_class = nullptr;
-                    ic.cached_method = nullptr;
-                }
-            }
+        const InlineCache& site = method->inline_caches[ic_idx];
+        Method* targetMethod = klass->lookup_method(site.method_name);
+        if (!targetMethod) {
+            throw std::runtime_error("Class '" + klass->name + "' does not implement operator method '" + site.method_name + "'");
         }
 
         std::vector<Value> callArgs = { right };
@@ -86,29 +70,34 @@ Value Interpreter::execute_binary_op(Method* method, uint32_t ic_idx, Opcode op,
 
 Value Interpreter::execute(Method* method, Value receiver, const std::vector<Value>& args) {
     auto& callStack = vm->getCallStack();
-    callStack.emplace_back();
-    StackFrame& frame = callStack.back();
-    frame.method = method;
-
-    // Initialize local variables array
-    frame.locals.resize(method->num_locals, make_null());
+    auto& stack = vm->getStack();
+    const size_t frameIndex = callStack.size();
+    const size_t base = stack.size();
+    callStack.push_back({method, base, base + method->num_locals});
+    stack.resize(base + method->num_locals, make_null());
 
     // Parameters setup:
     // For methods, param 0 is 'this' (receiver).
     size_t localOffset = 0;
     if (!method->params.empty() && method->params[0] == "this") {
-        frame.locals[0] = receiver;
+        stack[base] = receiver;
         localOffset = 1;
     }
 
-    for (size_t i = 0; i < args.size() && (i + localOffset) < frame.locals.size(); ++i) {
-        frame.locals[i + localOffset] = args[i];
+    for (size_t i = 0; i < args.size() && (i + localOffset) < method->num_locals; ++i) {
+        stack[base + i + localOffset] = args[i];
     }
 
     const uint8_t* ip = method->bytecode.data();
     const uint8_t* ipEnd = ip + method->bytecode.size();
 
-    auto& evalStack = frame.eval_stack;
+    auto push = [&stack](Value value) { stack.push_back(value); };
+    auto pop = [&stack]() {
+        Value value = stack.back();
+        stack.pop_back();
+        return value;
+    };
+    auto top = [&stack]() { return stack.back(); };
 
     while (ip < ipEnd) {
         Opcode op = static_cast<Opcode>(*ip++);
@@ -116,40 +105,38 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
         switch (op) {
             case OP_PUSH_CONST: {
                 uint32_t cidx = read_u32(ip);
-                evalStack.push_back(method->constants[cidx]);
+                push(method->constants[cidx]);
                 break;
             }
             case OP_PUSH_NULL: {
-                evalStack.push_back(make_null());
+                push(make_null());
                 break;
             }
             case OP_LOAD_LOCAL: {
                 uint32_t lidx = read_u32(ip);
-                evalStack.push_back(frame.locals[lidx]);
+                push(stack[base + lidx]);
                 break;
             }
             case OP_STORE_LOCAL: {
                 uint32_t lidx = read_u32(ip);
-                Value val = evalStack.back();
-                evalStack.pop_back();
-                frame.locals[lidx] = val;
+                Value val = pop();
+                stack[base + lidx] = val;
                 break;
             }
             case OP_LOAD_FIELD: {
                 uint32_t fidx = read_u32(ip);
-                Value thisVal = frame.locals[0];
+                Value thisVal = stack[base];
                 if (!is_obj(thisVal)) {
                     throw std::runtime_error("Attempted field access on non-object 'this'");
                 }
                 ToyObject* obj = decode_obj(thisVal);
-                evalStack.push_back(obj->fields[fidx]);
+                push(obj->fields[fidx]);
                 break;
             }
             case OP_STORE_FIELD: {
                 uint32_t fidx = read_u32(ip);
-                Value val = evalStack.back();
-                evalStack.pop_back();
-                Value thisVal = frame.locals[0];
+                Value val = pop();
+                Value thisVal = stack[base];
                 if (!is_obj(thisVal)) {
                     throw std::runtime_error("Attempted field assignment on non-object 'this'");
                 }
@@ -165,7 +152,7 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
                     throw std::runtime_error("Unknown class '" + std::string(className) + "'");
                 }
                 ToyObject* obj = vm->allocate_object(klass);
-                evalStack.push_back(encode_obj(obj));
+                push(encode_obj(obj));
                 break;
             }
             case OP_ADD:
@@ -180,22 +167,22 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
             case OP_EQ:
             case OP_NE: {
                 uint32_t ic_idx = read_u32(ip);
-                Value right = evalStack.back(); evalStack.pop_back();
-                Value left = evalStack.back(); evalStack.pop_back();
+                Value right = pop();
+                Value left = pop();
                 Value res = execute_binary_op(method, ic_idx, op, left, right);
-                evalStack.push_back(res);
+                push(res);
                 break;
             }
             case OP_REF_EQ: {
-                Value right = evalStack.back(); evalStack.pop_back();
-                Value left = evalStack.back(); evalStack.pop_back();
-                evalStack.push_back(encode_int((left == right) ? 1 : 0));
+                Value right = pop();
+                Value left = pop();
+                push(encode_int((left == right) ? 1 : 0));
                 break;
             }
             case OP_REF_NE: {
-                Value right = evalStack.back(); evalStack.pop_back();
-                Value left = evalStack.back(); evalStack.pop_back();
-                evalStack.push_back(encode_int((left != right) ? 1 : 0));
+                Value right = pop();
+                Value left = pop();
+                push(encode_int((left != right) ? 1 : 0));
                 break;
             }
             case OP_JUMP: {
@@ -205,7 +192,7 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
             }
             case OP_JUMP_IF_FALSE: {
                 int32_t offset = read_i32(ip);
-                Value cond = evalStack.back(); evalStack.pop_back();
+                Value cond = pop();
                 if (!is_truthy(cond)) {
                     ip += offset;
                 }
@@ -222,12 +209,11 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
 
                 std::vector<Value> callArgs(argCount);
                 for (int i = static_cast<int>(argCount) - 1; i >= 0; --i) {
-                    callArgs[i] = evalStack.back();
-                    evalStack.pop_back();
+                    callArgs[i] = pop();
                 }
 
                 Value retVal = vm->call_global(globalFunc, callArgs);
-                evalStack.push_back(retVal);
+                push(retVal);
                 break;
             }
             case OP_CALL_METHOD: {
@@ -236,12 +222,10 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
 
                 std::vector<Value> callArgs(argCount);
                 for (int i = static_cast<int>(argCount) - 1; i >= 0; --i) {
-                    callArgs[i] = evalStack.back();
-                    evalStack.pop_back();
+                    callArgs[i] = pop();
                 }
 
-                Value targetRecv = evalStack.back();
-                evalStack.pop_back();
+                Value targetRecv = pop();
 
                 if (!is_obj(targetRecv)) {
                     throw std::runtime_error("Attempted method call on non-object receiver");
@@ -249,48 +233,31 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
 
                 ToyObject* obj = decode_obj(targetRecv);
                 Class* klass = obj->klass;
-                InlineCache& ic = method->inline_caches[ic_idx];
-
-                Method* targetMethod = nullptr;
-                if (ic.cached_class == klass) {
-                    ic.hit_count++;
-                    targetMethod = ic.cached_method;
-                } else {
-                    ic.miss_count++;
-                    targetMethod = klass->lookup_method(ic.method_name);
-                    if (!targetMethod) {
-                        throw std::runtime_error("Method '" + ic.method_name + "' not found in class '" + klass->name + "'");
-                    }
-                    if (!ic.is_megamorphic) {
-                        if (ic.cached_class == nullptr) {
-                            ic.cached_class = klass;
-                            ic.cached_method = targetMethod;
-                        } else {
-                            ic.is_megamorphic = true;
-                            ic.cached_class = nullptr;
-                            ic.cached_method = nullptr;
-                        }
-                    }
+                const InlineCache& site = method->inline_caches[ic_idx];
+                Method* targetMethod = klass->lookup_method(site.method_name);
+                if (!targetMethod) {
+                    throw std::runtime_error("Method '" + site.method_name + "' not found in class '" + klass->name + "'");
                 }
 
                 Value retVal = vm->call_method(targetMethod, targetRecv, callArgs);
-                evalStack.push_back(retVal);
+                push(retVal);
                 break;
             }
             case OP_RETURN: {
                 Value retVal = make_null();
-                if (!evalStack.empty()) {
-                    retVal = evalStack.back();
+                if (stack.size() > callStack[frameIndex].locals_end) {
+                    retVal = top();
                 }
+                stack.resize(base);
                 callStack.pop_back();
                 return retVal;
             }
             case OP_POP: {
-                if (!evalStack.empty()) evalStack.pop_back();
+                if (stack.size() > callStack[frameIndex].locals_end) pop();
                 break;
             }
             case OP_DUP: {
-                if (!evalStack.empty()) evalStack.push_back(evalStack.back());
+                if (stack.size() > callStack[frameIndex].locals_end) push(top());
                 break;
             }
             default:
@@ -298,6 +265,7 @@ Value Interpreter::execute(Method* method, Value receiver, const std::vector<Val
         }
     }
 
+    stack.resize(base);
     callStack.pop_back();
     return make_null();
 }
