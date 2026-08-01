@@ -45,7 +45,7 @@ public:
     Value call_global(Method* method, const std::vector<Value>& args);
 
     // JIT compiler compilation trigger threshold
-    static const uint32_t JIT_THRESHOLD = 2000000000;
+    static const uint32_t JIT_THRESHOLD = 20;
     void maybe_jit_compile(Method* method);
 
     // Accessors

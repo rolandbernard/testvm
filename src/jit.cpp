@@ -8,7 +8,11 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <set>
+#include <unordered_map>
+#include <algorithm>
 #include <cstring>
+#include <deque>
 
 static bool jit_initialized = false;
 
@@ -163,6 +167,16 @@ private:
     Method* method;
     OMR::JitBuilder::IlType* pInt64 = nullptr;
 
+    // OMR stores the raw name pointer as the symbol key, so dynamically built
+    // names must stay alive for the lifetime of the builder. A deque keeps the
+    // strings stable (std::string uses SSO, so vector reallocation would move
+    // short strings and dangle the returned pointers).
+    std::deque<std::string> _nameStorage;
+    const char* keep(const std::string& name) {
+        _nameStorage.push_back(name);
+        return _nameStorage.back().c_str();
+    }
+
     static uint32_t read_u32(const uint8_t*& ip) {
         uint32_t val;
         std::memcpy(&val, ip, sizeof(uint32_t));
@@ -181,9 +195,9 @@ private:
 bool ToyJitMethodBuilder::buildIL() {
     // Define local variables for VM method locals
     for (uint32_t i = 0; i < method->num_locals; ++i) {
-        std::string locName = "loc_" + std::to_string(i);
-        DefineLocal(locName.c_str(), Int64);
-        Store(locName.c_str(), ConstInt64(make_null()));
+        const char* locName = keep("loc_" + std::to_string(i));
+        DefineLocal(locName, Int64);
+        Store(locName, ConstInt64(make_null()));
     }
 
     // Unpack arguments and receiver into local variables
@@ -195,189 +209,267 @@ bool ToyJitMethodBuilder::buildIL() {
 
     size_t numArgs = method->params.size() - localOffset;
     for (size_t i = 0; i < numArgs; ++i) {
-        std::string locName = "loc_" + std::to_string(i + localOffset);
+        const char* locName = keep("loc_" + std::to_string(i + localOffset));
         OMR::JitBuilder::IlValue* argElem = IndexAt(pInt64, Load("args_ptr"), ConstInt32(static_cast<int32_t>(i)));
-        Store(locName.c_str(), LoadAt(Int64, argElem));
+        Store(locName, LoadAt(pInt64, argElem));
     }
 
-    // Translate Bytecode instructions
-    std::vector<OMR::JitBuilder::IlValue*> evalStack;
-    const uint8_t* ip = method->bytecode.data();
-    const uint8_t* ipEnd = ip + method->bytecode.size();
+    // ---- Pass 1: discover jump targets and split the bytecode into blocks.
+    const uint8_t* bytecode = method->bytecode.data();
+    const uint8_t* codeEnd = bytecode + method->bytecode.size();
 
-    while (ip < ipEnd) {
-        Opcode op = static_cast<Opcode>(*ip++);
-
-        switch (op) {
-            case OP_PUSH_CONST: {
-                uint32_t cidx = read_u32(ip);
-                evalStack.push_back(ConstInt64(method->constants[cidx]));
-                break;
-            }
-            case OP_PUSH_NULL: {
-                evalStack.push_back(ConstInt64(make_null()));
-                break;
-            }
-            case OP_LOAD_LOCAL: {
-                uint32_t lidx = read_u32(ip);
-                std::string locName = "loc_" + std::to_string(lidx);
-                evalStack.push_back(Load(locName.c_str()));
-                break;
-            }
-            case OP_STORE_LOCAL: {
-                uint32_t lidx = read_u32(ip);
-                std::string locName = "loc_" + std::to_string(lidx);
-                OMR::JitBuilder::IlValue* val = evalStack.back(); evalStack.pop_back();
-                Store(locName.c_str(), val);
-                break;
-            }
-            case OP_LOAD_FIELD: {
-                uint32_t fidx = read_u32(ip);
-                OMR::JitBuilder::IlValue* thisVal = Load("loc_0");
-                size_t offset = sizeof(ObjectHeader) + sizeof(Class*) + fidx * sizeof(Value);
-                OMR::JitBuilder::IlValue* fieldAddr = Add(thisVal, ConstInt64(offset));
-                evalStack.push_back(LoadAt(Int64, fieldAddr));
-                break;
-            }
-            case OP_STORE_FIELD: {
-                uint32_t fidx = read_u32(ip);
-                OMR::JitBuilder::IlValue* val = evalStack.back(); evalStack.pop_back();
-                OMR::JitBuilder::IlValue* thisVal = Load("loc_0");
-                size_t offset = sizeof(ObjectHeader) + sizeof(Class*) + fidx * sizeof(Value);
-                OMR::JitBuilder::IlValue* fieldAddr = Add(thisVal, ConstInt64(offset));
-                StoreAt(fieldAddr, val);
-                break;
-            }
-            case OP_NEW_OBJECT: {
-                uint32_t cidx = read_u32(ip);
-                const char* className = reinterpret_cast<const char*>(method->constants[cidx]);
-                OMR::JitBuilder::IlValue* obj = Call("jit_helper_allocate_object", 2, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(className)));
-                evalStack.push_back(obj);
-                break;
-            }
-            case OP_ADD:
-            case OP_SUB:
-            case OP_MUL:
-            case OP_DIV:
-            case OP_REM:
-            case OP_LT:
-            case OP_LE:
-            case OP_GT:
-            case OP_GE:
-            case OP_EQ:
-            case OP_NE: {
-                uint32_t ic_idx = read_u32(ip);
-                OMR::JitBuilder::IlValue* right = evalStack.back(); evalStack.pop_back();
-                OMR::JitBuilder::IlValue* left = evalStack.back(); evalStack.pop_back();
-
-                OMR::JitBuilder::IlValue* res = Call("jit_helper_binary_op", 6,
-                    Load("vm_ptr"),
-                    ConstInt64(reinterpret_cast<int64_t>(method)),
-                    ConstInt32(ic_idx),
-                    ConstInt32(static_cast<int32_t>(op)),
-                    left,
-                    right);
-                evalStack.push_back(res);
-                break;
-            }
-            case OP_REF_EQ: {
-                OMR::JitBuilder::IlValue* right = evalStack.back(); evalStack.pop_back();
-                OMR::JitBuilder::IlValue* left = evalStack.back(); evalStack.pop_back();
-                OMR::JitBuilder::IlValue* eq = EqualTo(left, right);
-                OMR::JitBuilder::IlValue* taggedEq = Or(ShiftL(eq, ConstInt64(1)), ConstInt64(1));
-                evalStack.push_back(taggedEq);
-                break;
-            }
-            case OP_REF_NE: {
-                OMR::JitBuilder::IlValue* right = evalStack.back(); evalStack.pop_back();
-                OMR::JitBuilder::IlValue* left = evalStack.back(); evalStack.pop_back();
-                OMR::JitBuilder::IlValue* ne = NotEqualTo(left, right);
-                OMR::JitBuilder::IlValue* taggedNe = Or(ShiftL(ne, ConstInt64(1)), ConstInt64(1));
-                evalStack.push_back(taggedNe);
-                break;
-            }
-            case OP_JUMP: {
+    std::set<uint32_t> jumpTargets;
+    {
+        const uint8_t* ip = bytecode;
+        while (ip < codeEnd) {
+            Opcode op = static_cast<Opcode>(*ip++);
+            if (op == OP_JUMP || op == OP_JUMP_IF_FALSE) {
                 int32_t offset = read_i32(ip);
-                ip += offset;
-                break;
+                jumpTargets.insert(static_cast<uint32_t>(ip - bytecode) + static_cast<uint32_t>(offset));
             }
-            case OP_JUMP_IF_FALSE: {
-                int32_t offset = read_i32(ip);
-                OMR::JitBuilder::IlValue* cond = evalStack.back(); evalStack.pop_back();
-                ip += offset;
-                break;
-            }
-            case OP_CALL_GLOBAL: {
-                uint32_t cidx = read_u32(ip);
-                uint32_t argCount = read_u32(ip);
-                const char* funcName = reinterpret_cast<const char*>(method->constants[cidx]);
-
-                std::vector<OMR::JitBuilder::IlValue*> args(argCount);
-                for (int i = static_cast<int>(argCount) - 1; i >= 0; --i) {
-                    args[i] = evalStack.back();
-                    evalStack.pop_back();
-                }
-
-                OMR::JitBuilder::IlValue* retVal = nullptr;
-                if (argCount == 0) {
-                    retVal = Call("jit_helper_call_global_0", 2, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(funcName)));
-                } else if (argCount == 1) {
-                    retVal = Call("jit_helper_call_global_1", 3, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(funcName)), args[0]);
-                } else if (argCount == 2) {
-                    retVal = Call("jit_helper_call_global_2", 4, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(funcName)), args[0], args[1]);
-                } else {
-                    retVal = Call("jit_helper_call_global_0", 2, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(funcName)));
-                }
-                evalStack.push_back(retVal);
-                break;
-            }
-            case OP_CALL_METHOD: {
-                uint32_t ic_idx = read_u32(ip);
-                uint32_t argCount = read_u32(ip);
-
-                std::vector<OMR::JitBuilder::IlValue*> args(argCount);
-                for (int i = static_cast<int>(argCount) - 1; i >= 0; --i) {
-                    args[i] = evalStack.back();
-                    evalStack.pop_back();
-                }
-
-                OMR::JitBuilder::IlValue* receiver = evalStack.back(); evalStack.pop_back();
-
-                OMR::JitBuilder::IlValue* retVal = nullptr;
-                if (argCount == 0) {
-                    retVal = Call("jit_helper_call_method_0", 4, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(method)), ConstInt32(ic_idx), receiver);
-                } else if (argCount == 1) {
-                    retVal = Call("jit_helper_call_method_1", 5, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(method)), ConstInt32(ic_idx), receiver, args[0]);
-                } else if (argCount == 2) {
-                    retVal = Call("jit_helper_call_method_2", 6, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(method)), ConstInt32(ic_idx), receiver, args[0], args[1]);
-                } else {
-                    retVal = Call("jit_helper_call_method_0", 4, Load("vm_ptr"), ConstInt64(reinterpret_cast<int64_t>(method)), ConstInt32(ic_idx), receiver);
-                }
-                evalStack.push_back(retVal);
-                break;
-            }
-            case OP_RETURN: {
-                OMR::JitBuilder::IlValue* retVal = ConstInt64(make_null());
-                if (!evalStack.empty()) {
-                    retVal = evalStack.back();
-                }
-                Return(retVal);
-                return true;
-            }
-            case OP_POP: {
-                if (!evalStack.empty()) evalStack.pop_back();
-                break;
-            }
-            case OP_DUP: {
-                if (!evalStack.empty()) evalStack.push_back(evalStack.back());
-                break;
-            }
-            default:
-                break;
         }
     }
 
-    Return(ConstInt64(make_null()));
+    std::vector<uint32_t> blockStarts;
+    blockStarts.push_back(0);
+    {
+        const uint8_t* ip = bytecode;
+        while (ip < codeEnd) {
+            uint32_t pos = static_cast<uint32_t>(ip - bytecode);
+            Opcode op = static_cast<Opcode>(*ip++);
+            if (jumpTargets.count(pos) != 0) {
+                blockStarts.push_back(pos);
+            }
+            switch (op) {
+                case OP_JUMP:
+                case OP_JUMP_IF_FALSE: {
+                    (void)read_i32(ip);
+                    if (ip < codeEnd) blockStarts.push_back(static_cast<uint32_t>(ip - bytecode));
+                    break;
+                }
+                case OP_RETURN:
+                    if (ip < codeEnd) blockStarts.push_back(static_cast<uint32_t>(ip - bytecode));
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    std::sort(blockStarts.begin(), blockStarts.end());
+    blockStarts.erase(std::unique(blockStarts.begin(), blockStarts.end()), blockStarts.end());
+
+    // ---- Pass 2: create one builder per block and wire the CFG in order.
+    std::unordered_map<uint32_t, OMR::JitBuilder::IlBuilder*> blockBuilders;
+    for (uint32_t start : blockStarts) {
+        blockBuilders[start] = OrphanBuilder();
+    }
+
+    // All return sites jump here; the method returns the stored value.
+    DefineLocal("_retval", Int64);
+    Store("_retval", ConstInt64(make_null()));
+    OMR::JitBuilder::IlBuilder* returnLabel = OrphanBuilder();
+
+    OMR::JitBuilder::IlBuilder* current = this;
+    for (size_t bi = 0; bi < blockStarts.size(); ++bi) {
+        uint32_t start = blockStarts[bi];
+        uint32_t end = (bi + 1 < blockStarts.size()) ? blockStarts[bi + 1]
+                                                     : static_cast<uint32_t>(method->bytecode.size());
+
+        OMR::JitBuilder::IlBuilder* cur = blockBuilders[start];
+        current->AppendBuilder(cur);
+        current = cur;
+
+        std::vector<OMR::JitBuilder::IlValue*> stack;
+        const uint8_t* ip = bytecode + start;
+        const uint8_t* blockEnd = bytecode + end;
+        bool terminated = false;
+
+        while (ip < blockEnd && !terminated) {
+            Opcode op = static_cast<Opcode>(*ip++);
+
+            switch (op) {
+                case OP_PUSH_CONST: {
+                    uint32_t cidx = read_u32(ip);
+                    stack.push_back(cur->ConstInt64(method->constants[cidx]));
+                    break;
+                }
+                case OP_PUSH_NULL: {
+                    stack.push_back(cur->ConstInt64(make_null()));
+                    break;
+                }
+                case OP_LOAD_LOCAL: {
+                    uint32_t lidx = read_u32(ip);
+                    stack.push_back(cur->Load(keep("loc_" + std::to_string(lidx))));
+                    break;
+                }
+                case OP_STORE_LOCAL: {
+                    uint32_t lidx = read_u32(ip);
+                    OMR::JitBuilder::IlValue* val = stack.back(); stack.pop_back();
+                    cur->Store(keep("loc_" + std::to_string(lidx)), val);
+                    break;
+                }
+                case OP_LOAD_FIELD: {
+                    uint32_t fidx = read_u32(ip);
+                    OMR::JitBuilder::IlValue* thisAddr = cur->ConvertTo(Address, cur->Load("loc_0"));
+                    size_t offset = sizeof(ObjectHeader) + sizeof(Class*) + fidx * sizeof(Value);
+                    OMR::JitBuilder::IlValue* fieldAddr = cur->Add(thisAddr, cur->ConstInt64(offset));
+                    stack.push_back(cur->LoadAt(pInt64, fieldAddr));
+                    break;
+                }
+                case OP_STORE_FIELD: {
+                    uint32_t fidx = read_u32(ip);
+                    OMR::JitBuilder::IlValue* val = stack.back(); stack.pop_back();
+                    OMR::JitBuilder::IlValue* thisAddr = cur->ConvertTo(Address, cur->Load("loc_0"));
+                    size_t offset = sizeof(ObjectHeader) + sizeof(Class*) + fidx * sizeof(Value);
+                    OMR::JitBuilder::IlValue* fieldAddr = cur->Add(thisAddr, cur->ConstInt64(offset));
+                    cur->StoreAt(fieldAddr, val);
+                    break;
+                }
+                case OP_NEW_OBJECT: {
+                    uint32_t cidx = read_u32(ip);
+                    const char* className = reinterpret_cast<const char*>(method->constants[cidx]);
+                    OMR::JitBuilder::IlValue* obj = cur->Call("jit_helper_allocate_object", 2,
+                        cur->Load("vm_ptr"), cur->ConstInt64(reinterpret_cast<int64_t>(className)));
+                    stack.push_back(obj);
+                    break;
+                }
+                case OP_ADD:
+                case OP_SUB:
+                case OP_MUL:
+                case OP_DIV:
+                case OP_REM:
+                case OP_LT:
+                case OP_LE:
+                case OP_GT:
+                case OP_GE:
+                case OP_EQ:
+                case OP_NE: {
+                    uint32_t ic_idx = read_u32(ip);
+                    OMR::JitBuilder::IlValue* right = stack.back(); stack.pop_back();
+                    OMR::JitBuilder::IlValue* left = stack.back(); stack.pop_back();
+
+                    OMR::JitBuilder::IlValue* res = cur->Call("jit_helper_binary_op", 6,
+                        cur->Load("vm_ptr"),
+                        cur->ConstInt64(reinterpret_cast<int64_t>(method)),
+                        cur->ConstInt32(ic_idx),
+                        cur->ConstInt32(static_cast<int32_t>(op)),
+                        left,
+                        right);
+                    stack.push_back(res);
+                    break;
+                }
+                case OP_REF_EQ:
+                case OP_REF_NE: {
+                    OMR::JitBuilder::IlValue* right = stack.back(); stack.pop_back();
+                    OMR::JitBuilder::IlValue* left = stack.back(); stack.pop_back();
+
+                    OMR::JitBuilder::IlValue* eq = cur->EqualTo(left, right);
+                    OMR::JitBuilder::IlValue* tagged = cur->Or(
+                        cur->ShiftL(cur->ConvertTo(Int64, eq), cur->ConstInt32(1)), cur->ConstInt64(1));
+                    if (op == OP_REF_NE) {
+                        tagged = cur->Xor(tagged, cur->ConstInt64(2));
+                    }
+                    stack.push_back(tagged);
+                    break;
+                }
+                case OP_JUMP: {
+                    int32_t offset = read_i32(ip);
+                    uint32_t target = static_cast<uint32_t>(ip - bytecode) + static_cast<uint32_t>(offset);
+                    cur->Goto(blockBuilders[target]);
+                    terminated = true;
+                    break;
+                }
+                case OP_JUMP_IF_FALSE: {
+                    int32_t offset = read_i32(ip);
+                    uint32_t target = static_cast<uint32_t>(ip - bytecode) + static_cast<uint32_t>(offset);
+                    OMR::JitBuilder::IlValue* cond = stack.back(); stack.pop_back();
+
+                    // Truthiness: (tag & 1) ? (decode_int(cond) != 0) : (value != null)
+                    OMR::JitBuilder::IlValue* isInt = cur->ConvertTo(Int32, cur->And(cond, cur->ConstInt64(1)));
+                    OMR::JitBuilder::IlValue* asInt = cur->ShiftR(cond, cur->ConstInt32(1));
+                    OMR::JitBuilder::IlValue* intTruthy = cur->NotEqualTo(asInt, cur->ConstInt64(0));
+                    OMR::JitBuilder::IlValue* objTruthy = cur->NotEqualTo(cond, cur->ConstInt64(make_null()));
+                    OMR::JitBuilder::IlValue* truthy = cur->Select(isInt, intTruthy, objTruthy);
+
+                    // Branch when not truthy; otherwise fall through to the next block.
+                    cur->IfCmpEqualZero(blockBuilders[target], truthy);
+                    terminated = true;
+                    break;
+                }
+                case OP_CALL_GLOBAL: {
+                    uint32_t cidx = read_u32(ip);
+                    uint32_t argCount = read_u32(ip);
+                    const char* funcName = reinterpret_cast<const char*>(method->constants[cidx]);
+
+                    OMR::JitBuilder::IlValue* argsArr = cur->CreateLocalArray(static_cast<int32_t>(argCount), Int64);
+                    for (int i = static_cast<int>(argCount) - 1; i >= 0; --i) {
+                        OMR::JitBuilder::IlValue* elemAddr = cur->Add(argsArr, cur->ConstInt64(i * static_cast<int64_t>(sizeof(Value))));
+                        cur->StoreAt(elemAddr, stack.back());
+                        stack.pop_back();
+                    }
+                    OMR::JitBuilder::IlValue* retVal = cur->Call("jit_helper_call_global", 4,
+                        cur->Load("vm_ptr"),
+                        cur->ConstInt64(reinterpret_cast<int64_t>(funcName)),
+                        cur->ConstInt32(static_cast<int32_t>(argCount)),
+                        argsArr);
+                    stack.push_back(retVal);
+                    break;
+                }
+                case OP_CALL_METHOD: {
+                    uint32_t ic_idx = read_u32(ip);
+                    uint32_t argCount = read_u32(ip);
+
+                    OMR::JitBuilder::IlValue* argsArr = cur->CreateLocalArray(static_cast<int32_t>(argCount), Int64);
+                    for (int i = static_cast<int>(argCount) - 1; i >= 0; --i) {
+                        OMR::JitBuilder::IlValue* elemAddr = cur->Add(argsArr, cur->ConstInt64(i * static_cast<int64_t>(sizeof(Value))));
+                        cur->StoreAt(elemAddr, stack.back());
+                        stack.pop_back();
+                    }
+                    OMR::JitBuilder::IlValue* receiver = stack.back(); stack.pop_back();
+
+                    OMR::JitBuilder::IlValue* retVal = cur->Call("jit_helper_call_method", 6,
+                        cur->Load("vm_ptr"),
+                        cur->ConstInt64(reinterpret_cast<int64_t>(method)),
+                        cur->ConstInt32(ic_idx),
+                        receiver,
+                        cur->ConstInt32(static_cast<int32_t>(argCount)),
+                        argsArr);
+                    stack.push_back(retVal);
+                    break;
+                }
+                case OP_RETURN: {
+                    OMR::JitBuilder::IlValue* retVal = cur->ConstInt64(make_null());
+                    if (!stack.empty()) {
+                        retVal = stack.back();
+                        stack.pop_back();
+                    }
+                    cur->Store("_retval", retVal);
+                    cur->Goto(returnLabel);
+                    terminated = true;
+                    break;
+                }
+                case OP_POP: {
+                    if (!stack.empty()) stack.pop_back();
+                    break;
+                }
+                case OP_DUP: {
+                    if (!stack.empty()) stack.push_back(stack.back());
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
+        if (!terminated) {
+            // Fell off the end of the final block: implicit null return.
+            cur->Store("_retval", cur->ConstInt64(make_null()));
+            cur->Goto(returnLabel);
+        }
+    }
+
+    current->AppendBuilder(returnLabel);
+    returnLabel->Return(returnLabel->Load("_retval"));
     return true;
 }
 
