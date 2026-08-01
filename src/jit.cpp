@@ -158,6 +158,11 @@ public:
         DefineFunction("jit_helper_call_method", (char*)__FILE__, (char*)LINETOSTR(__LINE__), (void*)&jit_helper_call_method, Int64, 6, pInt64, pInt64, Int32, Int64, Int32, Address);
         DefineFunction("jit_helper_call_global", (char*)__FILE__, (char*)LINETOSTR(__LINE__), (void*)&jit_helper_call_global, Int64, 4, pInt64, pInt64, Int32, Address);
         DefineFunction("jit_helper_allocate_object", (char*)__FILE__, (char*)LINETOSTR(__LINE__), (void*)&jit_helper_allocate_object, Int64, 2, pInt64, pInt64);
+        // All compiled toy methods use this ABI.  ComputedCall below makes a
+        // direct compiled-to-compiled call when the target is already JITed;
+        // the ordinary helper remains the c2i adapter.
+        DefineFunction("toyvm_jit_entry", (char*)__FILE__, (char*)LINETOSTR(__LINE__),
+                       (void*)&jit_helper_call_global, Int64, 3, pInt64, Int64, Address);
     }
 
     virtual bool buildIL() override;
@@ -460,11 +465,26 @@ bool ToyJitMethodBuilder::buildIL() {
                         cur->StoreAt(elemAddr, stack.back());
                         stack.pop_back();
                     }
-                    OMR::JitBuilder::IlValue* retVal = cur->Call("jit_helper_call_global", 4,
-                        cur->Load("vm_ptr"),
-                        cur->ConstInt64(reinterpret_cast<int64_t>(funcName)),
-                        cur->ConstInt32(static_cast<int32_t>(argCount)),
-                        argsArr);
+                    Method* target = vm->getFunction(funcName);
+                    OMR::JitBuilder::IlValue* retVal = nullptr;
+                    if (target != nullptr && target->jit_entry != nullptr) {
+                        // c2c fast path: no name lookup, vector construction,
+                        // or VM dispatch.  The argument array is already the
+                        // required ABI representation.
+                        retVal = cur->ComputedCall((char*)"toyvm_jit_entry", 4,
+                            cur->ConstAddress(reinterpret_cast<void*>(target->jit_entry)),
+                            cur->Load("vm_ptr"),
+                            cur->ConstInt64(make_null()),
+                            argsArr);
+                    } else {
+                        // This is the c2i adapter and also covers targets that
+                        // become compiled after this caller was generated.
+                        retVal = cur->Call("jit_helper_call_global", 4,
+                            cur->Load("vm_ptr"),
+                            cur->ConstInt64(reinterpret_cast<int64_t>(funcName)),
+                            cur->ConstInt32(static_cast<int32_t>(argCount)),
+                            argsArr);
+                    }
                     stack.push_back(retVal);
                     break;
                 }

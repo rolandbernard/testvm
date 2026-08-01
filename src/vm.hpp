@@ -4,7 +4,7 @@
 #include "omr.h"
 #include "omrvm.h"
 #include "omrgc.h"
-#include "omrExampleVM.hpp"
+#include "toyvm_glue.hpp"
 #include "value.hpp"
 #include "object.hpp"
 #include "class.hpp"
@@ -34,7 +34,6 @@ public:
     ToyObject* allocate_object(Class* klass);
     void register_root(const char* name, ToyObject* obj);
     void unregister_root(const char* name);
-    void update_stack_roots();
 
     Class* getClass(const std::string& name) const;
     Method* getFunction(const std::string& name) const;
@@ -56,7 +55,7 @@ public:
     OMR_VMThread* getOMRThread() const { return omrVMThread; }
 
 private:
-    OMR_VM_Example exampleVM;
+    ToyVMGlue glueVM;
     OMR_VMThread* omrVMThread = nullptr;
 
     std::vector<std::unique_ptr<Class>> classes;
@@ -67,14 +66,7 @@ private:
     std::vector<StackFrame> call_stack;
     std::vector<Value> stack;
     std::vector<Value> temp_roots;
-    // RootEntry stores a borrowed char pointer. Keep names stable until the
-    // root table is rebuilt on the next allocation.
-    std::vector<std::string> stack_root_names;
-
-    // The example OMR glue updates RootEntry::rootPtr after an evacuation.
-    // Copy those forwarded pointers back into the actual language stack before
-    // execution resumes.
-    void synchronize_moved_roots();
+    void publish_stack_for_gc();
 };
 
 #endif // TOY_VM_HPP
